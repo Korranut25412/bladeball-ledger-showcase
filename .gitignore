@@ -1,0 +1,13 @@
+# ข้อมูลจริงและความลับ ห้ามขึ้น GitHub เด็ดขาด
+.env
+data/
+backup/
+*.db
+*.sqlite
+*.sqlite3
+
+__pycache__/
+*.pyc
+.Rhistory
+
+prompts/
