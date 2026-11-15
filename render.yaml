@@ -1,0 +1,44 @@
+# ตั้งค่าเครื่องเช่าฟรีบน Render
+#
+# ไฟล์นี้ทำให้ไม่ต้องไปกดตั้งค่าในหน้าเว็บทีละช่อง
+# Render อ่านไฟล์นี้จาก GitHub แล้วตั้งให้เองตอนสร้างบริการ (Blueprint)
+#
+# ทำไมเป็น type: web ไม่ใช่ worker
+#   worker ของ Render ไม่มีแบบฟรี  มีแต่ web ที่ฟรี
+#   บอทเราไม่ใช่เว็บ แต่แปะเว็บจิ๋วไว้ให้ Render ตรวจได้ (ดู src/health.py)
+#
+# ทำไมต้องมีตัวปิงจากข้างนอก
+#   web ฟรีจะพักเครื่องถ้าไม่มีใครเข้า 15 นาที พอพักแล้วบอทหยุดรับข้อความ
+#   วิธีแก้เขียนไว้ใน DEPLOY.md หัวข้อ "กันเครื่องหลับ"
+
+services:
+  - type: web
+    name: bladeball-ledger
+    runtime: python
+    plan: free
+    region: singapore          # ใกล้ไทยที่สุดในตัวเลือกของ Render
+    buildCommand: pip install -r requirements.txt
+    startCommand: python src/bot.py
+    healthCheckPath: /
+
+    envVars:
+      # sync: false = ไม่เก็บค่าไว้ในไฟล์นี้ ต้องไปพิมพ์ในหน้าเว็บ Render เอง
+      # สามตัวนี้เป็นความลับ ห้ามเขียนลงไฟล์ที่ขึ้น GitHub
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+
+      # ให้ล็อกภาษาไทยอ่านออก
+      - key: PYTHONIOENCODING
+        value: utf-8
+      # ให้ข้อความขึ้นล็อกทันที ไม่ต้องรอบัฟเฟอร์เต็ม
+      # ตอนบอทมีปัญหาแล้วไปนั่งอ่านล็อก ถ้าไม่ตั้งอันนี้จะไม่เห็นอะไรเลย
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      # ค่าที่เหลือไม่ต้องตั้ง เพราะค่าปริยายในโค้ดตรงกับที่ใช้อยู่แล้ว
+      # (เป้า 8,800 · เงินค้างกรุงไทย 1,000 · เริ่มเก็บข้อมูล 15 ก.ย. 2026)
+      # ถ้าวันหลังเป้าเปลี่ยน ให้มาเพิ่ม TARGET_MONTH ที่นี่
