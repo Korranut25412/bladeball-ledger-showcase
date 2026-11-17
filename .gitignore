@@ -11,3 +11,6 @@ __pycache__/
 .Rhistory
 
 prompts/
+
+# รูปที่ prep.py สร้าง (สร้างใหม่ทุกรอบ)
+posting/ready/

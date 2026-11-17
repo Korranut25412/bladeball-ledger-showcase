@@ -974,6 +974,11 @@ def handle_sale_lines(conn, chat_id, text):
         for s in sales:
             dup = db.find_duplicate(conn, s)
             sale_id = db.insert_sale(conn, s)
+            # ต้นทุนจริงคิดใหม่ตอนบันทึก (ใช้ Token ชุดล่าสุดก่อน — ดู db.lifo_costs)
+            # เรทที่ parser ใส่มาเป็นแค่ค่าชั่วคราว ต้องอ่านกลับมาโชว์ให้ตรงกับที่เก็บจริง
+            saved = db.sale_by_id(conn, sale_id)
+            s["token_rate"] = float(saved["token_rate"])
+            s["source"] = saved["source"]
             if dup:
                 dupes.append((sale_id, dup["id"]))
             total_profit += s["price_baht"] - s["tokens_spent"] / s["token_rate"]
@@ -985,9 +990,11 @@ def handle_sale_lines(conn, chat_id, text):
             for new_id, old_id in dupes:
                 reply.append(f"#{new_id} ซ้ำกับ #{old_id} ที่เพิ่งจดไปเมื่อกี้")
             reply.append("<i>ถ้าจดซ้ำจริง พิมพ์</i> <code>/undo</code> <i>ลบอันล่าสุด</i>")
-        if any(s["rate_from_default"] for s in sales):
-            src = db.get_state(conn, "current_rate_src", "ค่าปริยาย")
-            reply.append(f"<i>บรรทัดที่ไม่ได้ใส่เรท คิดที่ {rate:.2f} — จาก {src}</i>")
+        # เรทคิดจาก Token ชุดที่ซื้อล่าสุดก่อน หมดแล้วย้อนไปชุดก่อนหน้า (กติกาเจ้าของ 16 พ.ย. 2026)
+        # เรทที่พิมพ์ในบรรทัดเองจึงไม่ถูกใช้แล้ว ต้องบอกให้รู้ ไม่งั้นจะงงว่าทำไมไม่ตรง
+        reply.append("<i>ต้นทุนคิดจาก Token ชุดที่ซื้อล่าสุดก่อน หมดแล้วใช้ชุดก่อนหน้า</i>")
+        if any(not s["rate_from_default"] for s in sales):
+            reply.append("<i>เรทที่พิมพ์ในบรรทัดไม่ถูกใช้ บอทคิดจากชุด Token ให้เอง</i>")
 
         # เตือนเมื่อทุนสูงกว่าราคาขายมากผิดปกติ
         #
@@ -1192,6 +1199,47 @@ def booth_record_text(conn, nums, skipped) -> str:
     return head
 
 
+def stock_tokens_at(conn, month_start: str) -> float:
+    """
+    ของตุนตอนต้นเดือน (Token ในไอดี + ของในบูธหลังหักค่าธรรมเนียม)
+
+    ทำไมต้องนับบูธด้วย
+    ------------------
+    ปลายเดือนบอทนับ "Token ในไอดี + บูธ" (st["on_hand"])
+    แต่เดิมต้นเดือนนับแค่ Token ในไอดี — บูธทั้งก้อนเลยถูกนับเป็น "ของตุนเพิ่มขึ้น"
+    ทั้งที่ของชุดนั้นอยู่ในบูธมาตั้งแต่เดือนก่อน
+    16 พ.ย. 2026 เจอจริง: บูธ 15,650 Token จดไว้ 20 ต.ค. ทำให้กำไรจริง พ.ย.
+    ขึ้นเป็น 8,318฿ ทั้งที่ควรเป็นราว 6,843฿ (เกินมา ~1,475฿)
+
+    ต้นกับปลายต้องนับด้วยวิธีเดียวกัน ไม่งั้นผลต่างไม่มีความหมาย
+    ยอดบูธเก็บไว้แค่ค่าล่าสุด จึงนับเข้าต้นเดือนได้เฉพาะถ้าจดไว้ "ก่อน" เดือนนี้
+    ถ้าจดระหว่างเดือน ไม่รู้ว่าต้นเดือนบูธมีเท่าไหร่ — ถึงต้องจดสำรองไว้ทุกต้นเดือน
+    (ดู save_month_stock ใน run_scheduled_jobs)
+    """
+    day_before = (date.fromisoformat(month_start) - timedelta(days=1)).isoformat()
+    tokens = max(db.token_balance(conn, day_before)["expected"], 0)
+    booth = int(db.get_state(conn, "booth_tokens", 0) or 0)
+    booth_at = db.state_updated_at(conn, "booth_tokens")
+    if booth and booth_at and str(booth_at)[:10] < month_start:
+        tokens += booth * (1 - BOOTH_FEE)
+    return float(tokens)
+
+
+def save_month_stock(conn, today: date):
+    """
+    จดของตุนตอนต้นเดือนเก็บไว้ ครั้งเดียวต่อเดือน
+
+    เดิมโค้ดอ่านค่า stock_tokens_YYYY-MM แต่ไม่มีที่ไหนเขียนเลย
+    เลยต้องย้อนคำนวณทุกครั้ง ซึ่งพังทันทีที่จดเลขบูธใหม่ระหว่างเดือน
+    (บูธเก็บแค่ค่าล่าสุด ค่าตอนต้นเดือนหายไปแล้ว)
+    จดตอนต้นเดือนไว้ก่อน ตัวเลขจะนิ่ง ไม่เปลี่ยนตามการจดบูธทีหลัง
+    """
+    month_start = today.replace(day=1).isoformat()
+    key = f"stock_tokens_{month_start[:7]}"
+    if db.get_state(conn, key) is None:
+        db.set_state(conn, key, round(stock_tokens_at(conn, month_start), 2))
+
+
 def booth_warning(st) -> str:
     """ข้อความเตือนเลขบูธค้าง — ใช้ซ้ำหลายคำสั่ง"""
     if not st["booth_stale"]:
@@ -1227,8 +1275,7 @@ def text_true_profit(conn) -> str:
         tokens_start = float(snapshot)
         start_note = None
     else:
-        day_before = (date.fromisoformat(start) - timedelta(days=1)).isoformat()
-        tokens_start = max(db.token_balance(conn, day_before)["expected"], 0)
+        tokens_start = stock_tokens_at(conn, start)
         start_note = "ของตุนตอนต้นเดือนย้อนคำนวณให้ ยังไม่ได้บันทึกไว้ตอนนั้น"
 
     t = db.true_profit(conn, start, end, st["rate"],
@@ -2222,11 +2269,17 @@ def nightly_target(now) -> date:
 def run_scheduled_jobs(conn):
     now = db.now_th()
 
+    # จดของตุนต้นเดือนไว้ก่อนที่เลขบูธจะถูกเปลี่ยน (ทำครั้งเดียว มีแล้วข้าม)
+    save_month_stock(conn, now.date())
+
     # สรุปประจำคืน — ยิงในช่วง 5 ชั่วโมงหลังเวลาที่ตั้งไว้
     # (ไม่ใช่ "หลังจากเวลานั้นตลอดไป" ไม่งั้นเปิดบอทตอนเย็นแล้วเด้งทันที)
     target = nightly_target(now).isoformat()
     key = f"nightly:{target}"
     if NIGHTLY_HOUR <= now.hour < NIGHTLY_HOUR + 5 and not db.job_already_ran(conn, key):
+        # ตามเติมคนทักของวันก่อนๆ ด้วย (เช่นวันขายไม่ได้ ที่เพิ่งกดเหตุผล "ไม่มีคนทัก" ทีหลัง)
+        db.fill_default_inquiries(
+            conn, (date.fromisoformat(target) - timedelta(days=1)).isoformat())
         s = db.day_summary(conn, target)
         if s["orders"] == 0 and not s["no_sale_reason"]:
             push(f"{fmt_date(target)} ยังไม่มีการขาย · เพราะอะไรครับ?\n"
@@ -2247,12 +2300,14 @@ def run_scheduled_jobs(conn):
             #
             # ตัวเลขนี้สำคัญเพราะเป็นตัวเดียวที่แยกได้ว่าวันแย่เกิดจาก
             # "ไม่มีคนทัก" หรือ "ทักแล้วปิดการขายไม่ได้" ซึ่งแก้คนละวิธีสิ้นเชิง
+            #
+            # 16 พ.ย. 2026 เจ้าของสั่ง: ไม่ได้จด = ถือว่าปิดได้ 100% (คนทัก = ออเดอร์)
+            # บอทเติมให้เองแล้วบอก ถ้าไม่ใช่ค่อยพิมพ์ /ทัก ทับ (ดู db.fill_default_inquiries)
             if db.day_summary(conn, target)["inquiries"] is None:
-                msg += (f"\n\n<b>วันนี้มีคนทักกี่คน</b> "
-                        f"(นับคร่าวๆ ก็ได้)\n"
-                        f"<i>พิมพ์</i> <code>/ทัก 12</code>\n"
-                        f"<i>ตัวเลขนี้จะบอกได้ว่าวันที่ได้น้อย "
-                        f"เพราะคนทักน้อย หรือทักแล้วปิดไม่ได้</i>")
+                db.fill_default_inquiries(conn, target)
+                msg += (f"\n\n<i>ไม่ได้จดคนทัก — ถือว่าปิดได้ 100% "
+                        f"(คนทัก = {s['orders']} คน) ถ้ามากกว่านี้พิมพ์</i> "
+                        f"<code>/ทัก 12</code>")
 
             msg += "\n\n<i>ขายดึกหลังเที่ยงคืน พิมพ์</i> <code>เมื่อวาน 55 192</code>"
             push(msg)

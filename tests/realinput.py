@@ -646,10 +646,12 @@ else:
     rev = conn.execute("SELECT SUM(price_baht) FROM sale").fetchone()[0]
     check("ข้อมูลจริง /undo แล้วกลับมาเท่าเดิมเป๊ะ", n_sales() == base_n and abs(rev - base_rev) < 0.01,
           f"{n_sales()} {rev}")
+    # เรทคิดจากชุด Token (LIFO) แก้ด้วยตัวเลขเดิม ต้นทุนต้องไม่ขยับ
+    want_rate = round(db.lifo_costs(conn)[0][44], 3)
     r = tg("/แก้ 44 750 12801")
     row = conn.execute("SELECT * FROM sale WHERE id = 44").fetchone()
     check("ข้อมูลจริง /แก้ #44 ไม่เปลี่ยนเรท/วันที่/หมายเหตุ",
-          row is not None and abs(row["token_rate"] - 11.006) < 0.001
+          row is not None and abs(row["token_rate"] - want_rate) < 0.001
           and row["sold_on"] == "2026-09-19" and "6,304" in (row["note"] or ""), str(dict(row) if row else None))
     conn.close()
     copy.unlink()

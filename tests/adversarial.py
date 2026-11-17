@@ -234,14 +234,17 @@ old = conn.execute("SELECT id, sold_on FROM sale ORDER BY id DESC LIMIT 1").fetc
 say("/ซื้อ 1000 100")                       # เรทเปลี่ยนเป็น 10 ก่อนมาแก้
 say(f"/แก้ {old['id']} 750 12801")
 row = conn.execute("SELECT * FROM sale WHERE id = ?", (old["id"],)).fetchone()
-check("/แก้ ไม่ใส่เรท ต้องใช้เรทเดิมของออเดอร์ ไม่ใช่เรทปัจจุบัน",
-      abs(row["token_rate"] - 11.0) < 0.001, str(row["token_rate"]))
+# กติกา LIFO (16 พ.ย. 2026): ใช้ชุดที่มีตอนขายก่อน (1,100 @11)
+# ที่ขาดเอาจากชุดถัดไป (1,000 @10) ที่เหลือคิดที่เรทซื้อล่าสุด (10)
+_lifo = 12801 / (1100 / 11 + 1000 / 10 + 10701 / 10)
+check("/แก้ คิดต้นทุนใหม่ตามชุด Token (LIFO)",
+      abs(row["token_rate"] - _lifo) < 0.001, f"{row['token_rate']} ควรเป็น {_lifo:.3f}")
 check("/แก้ ไม่ใส่ # ต้องเก็บหมายเหตุเดิมไว้", row["note"] == "ของน้อง NX", str(row["note"]))
 check("/แก้ ไม่ย้ายวันที่ของออเดอร์เก่า", row["sold_on"] == old["sold_on"], str(row["sold_on"]))
 check("/แก้ ตัวเลขใหม่ถูกบันทึก", row["tokens_spent"] == 12801, str(row["tokens_spent"]))
 say(f"/แก้ {old['id']} 750 12801 12.5 #หมายเหตุใหม่")
 row = conn.execute("SELECT * FROM sale WHERE id = ?", (old["id"],)).fetchone()
-check("/แก้ ใส่เรทมาเอง ต้องใช้เรทที่ใส่", abs(row["token_rate"] - 12.5) < 0.001,
+check("/แก้ ใส่เรทมาเอง ไม่ถูกใช้ คิดตามชุด Token เหมือนเดิม", abs(row["token_rate"] - _lifo) < 0.001,
       str(row["token_rate"]))
 check("/แก้ ใส่ # มา ต้องใช้หมายเหตุใหม่", row["note"] == "หมายเหตุใหม่", str(row["note"]))
 

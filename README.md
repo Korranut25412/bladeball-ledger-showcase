@@ -3,16 +3,17 @@
 # bladeball-ledger
 
 A bookkeeping system for my **Blade Ball (Roblox)** item shop, which I've run as a real business for 2 years.
-Collect data → calculate true cost → analyze with SQL → build a dashboard → make real decisions.
+Collect data → calculate true cost → analyze with SQL → make real decisions.
 
-> **Status:** Data collection started on 16 Sep 2026 · for the 2 years before that, I never recorded anything.
+> **Status:** Data collection started on 15 Sep 2026 · for the 2 years before that, I never recorded anything.
+> **So far (15 Sep – 17 Nov 2026):** 456 orders · 612 items · THB 130,486 in revenue · 133 stock purchases
 
 ---
 
 ## The Problem
 
-The shop sells in-game items to Thai customers through 2 Facebook groups. Profit is about 5,000 THB/month.
-The target is 8,800 THB/month, but there is **no data at all**. Everything is a guess.
+The shop sells in-game items to Thai customers through 2 Facebook groups.
+Before this project there was **no data at all**. Every number was a guess.
 
 The main question I couldn't answer:
 
@@ -114,7 +115,7 @@ Item names are still stored in the `note` column for reference, but never aggreg
 
 ---
 
-## Hypothesis to Be Tested With Data
+## Hypothesis Tested With Data
 
 The shop's pricing doesn't follow a formula. It follows habit, and the result is an **inverted profit ratio**:
 
@@ -131,8 +132,22 @@ The shop uses tiered flat prices (e.g. a 55 or 80 THB bundle) while costs vary s
 Expensive items get negotiated down to 1.2–1.5x cost, so profit per sale ends up about the same as cheap items,
 but finding the stock takes far longer.
 
-If the data confirms this, it means I should **stop chasing expensive items**. That is the decision this project is meant to answer.
+If the data confirmed this, it would mean I should **stop chasing expensive items**. That was the decision this project was meant to answer.
 → See [`analysis/queries.sql`](analysis/queries.sql), Q2
+
+### Result (456 orders, 15 Sep – 17 Nov 2026)
+
+| Token band | Orders | Avg profit / order (THB) | Profit / Token |
+|---|---|---|---|
+| under 100 | 30 | 64 | 1.30 |
+| 100–299 | 83 | 79 | 0.44 |
+| 300–599 | 143 | 107 | 0.25 |
+| 600–1,499 | 116 | 147 | 0.16 |
+| 1,500+ | 84 | 434 | 0.09 |
+
+**Half right, and the wrong half mattered.** Cheap items do earn more *per Token*, but expensive orders earn **6.8x more profit per order** (434 vs 64 THB).
+Tokens are not a scarce resource, so profit per Token is the wrong metric; profit per order is the one that pays.
+**Decision: keep selling expensive items.** Dropping them would have cut the biggest source of profit.
 
 ---
 
@@ -145,10 +160,10 @@ Telegram (type a single line)
    src/parser.py     converts "55 192 10.5 ดาบ a" (sword, group a) into structured data
         │
         ▼
-   src/db.py  ──────► SQLite (data/ledger.db)
+   src/db.py  ──────► PostgreSQL (Supabase) in production · SQLite locally
         │                 └─ VIEW v_sale / v_day compute cost and profit in one place
         ▼
-   analysis/queries.sql → Power BI / dashboard
+   analysis/queries.sql → business questions answered with SQL
 ```
 
 **Why split into 3 files:** `parser.py` and `db.py` know nothing about Telegram.
@@ -242,7 +257,7 @@ tests/smoke.py        one-shot tests, run with: python tests/smoke.py
 
 ## Roadmap
 
-- [ ] Collect a full 30 days of data, then answer Q1 and Q2 with real data
-- [ ] Power BI dashboard + a record of what I decided from the data and how it turned out
-- [ ] Migrate SQLite → PostgreSQL (Supabase) so the bot runs in the cloud without leaving my PC on
+- [x] Collect a full 30 days of data, then answer Q2 with real data (see Result above)
+- [x] Migrate SQLite → PostgreSQL (Supabase) and deploy on Render, so the bot runs without my PC on
+- [ ] Dashboard + a record of what I decided from the data and how it turned out
 - [ ] Add a LINE channel (reusing `parser.py` / `db.py` as-is)
