@@ -6,7 +6,7 @@ A bookkeeping system for my **Blade Ball (Roblox)** item shop, which I've run as
 Collect data → calculate true cost → analyze with SQL → make real decisions.
 
 > **Status:** Data collection started on 15 Sep 2026 · for the 2 years before that, I never recorded anything.
-> **So far (15 Sep – 17 Nov 2026):** 456 orders · 612 items · THB 130,486 in revenue · 133 stock purchases
+> **So far (15 Sep – 17 Nov 2026):** 461 orders · 617 items · THB 131,726 in revenue · 134 stock purchases
 
 ---
 
@@ -135,7 +135,7 @@ but finding the stock takes far longer.
 If the data confirmed this, it would mean I should **stop chasing expensive items**. That was the decision this project was meant to answer.
 → See [`analysis/queries.sql`](analysis/queries.sql), Q2
 
-### Result (456 orders, 15 Sep – 17 Nov 2026)
+### Result (461 orders, 15 Sep – 17 Nov 2026)
 
 | Token band | Orders | Avg profit / order (THB) | Profit / Token |
 |---|---|---|---|
