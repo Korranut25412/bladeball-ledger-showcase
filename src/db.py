@@ -82,13 +82,185 @@ def insert_sale(conn, sale: dict) -> int:
     mark_day(conn, sale.get("sold_on") or today_th(), shop_open=1, no_sale_reason=None)
     remember_for_undo(conn, "sale", new_id)
     conn.commit()
+    recost_sales(conn)
     return new_id
 
 
 def delete_sale(conn, sale_id: int) -> bool:
     cur = conn.execute("DELETE FROM sale WHERE id = ?", (sale_id,))
     conn.commit()
+    recost_sales(conn)
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------- ต้นทุน Token (LIFO)
+
+def _layer_events(conn):
+    """
+    รวบรวมทุกอย่างที่ทำให้ Token เข้า/ออก เรียงตามเวลา
+
+    คืน list ของ (วันที่, เวลาที่จด, ลำดับ, id, ชนิด, ข้อมูล)
+    ลำดับใช้ตัดสินตอนวันและเวลาเท่ากัน — ของเข้าก่อนของออก
+    """
+    ev = []
+    for p in conn.execute(
+        "SELECT id, bought_on, logged_at, kind, baht, tokens, rap_total, tokens_realised "
+        "FROM purchase"
+    ).fetchall():
+        baht = float(p["baht"] or 0)
+        if p["kind"] == "token":
+            tokens = float(p["tokens"] or 0)
+        else:
+            # ของเหมา: ถ้า /ย่อย แล้วใช้ยอดจริง ไม่งั้นใช้ RAP หักค่าบูธ 1%
+            # (เจ้าของไม่ /ย่อย แล้วตั้งแต่ 30 ก.ย. — ตรวจ 16 พ.ย. 2026 ยอดนี้
+            #  รวมกับ Token ที่ซื้อ ตรงกับ Token ที่ใช้จริงทั้งหมดต่างกันไม่ถึง 0.5%)
+            tokens = (float(p["tokens_realised"]) if p["tokens_realised"] is not None
+                      else float(p["rap_total"] or 0) * 0.99)
+        if tokens > 0 and baht > 0:
+            ev.append((str(p["bought_on"]), str(p["logged_at"]), 0, p["id"], "in",
+                       {"tokens": tokens, "rate": tokens / baht, "kind": p["kind"]}))
+    for m in conn.execute(
+        "SELECT id, happened_on, logged_at, tokens, kind FROM token_move "
+        "WHERE kind IN ('open', 'booth_in', 'other_out')"
+    ).fetchall():
+        # adjust ไม่นับ: ส่วนใหญ่คือ Token จากของเหมาที่ขายออกจากบูธ
+        # ซึ่งนับไปแล้วตอนซื้อเหมา นับอีกรอบจะกลายเป็นได้ Token ฟรีซ้ำสอง
+        t = float(m["tokens"])
+        if t > 0:
+            ev.append((str(m["happened_on"]), str(m["logged_at"]), 0, m["id"], "free", {"tokens": t}))
+        elif t < 0:
+            ev.append((str(m["happened_on"]), str(m["logged_at"]), 1, m["id"], "out", {"tokens": -t}))
+    for s in conn.execute(
+        "SELECT id, sold_on, logged_at, tokens_spent, token_rate, source FROM sale"
+    ).fetchall():
+        ev.append((str(s["sold_on"]), str(s["logged_at"]), 1, s["id"], "sale", dict(s)))
+    # id เป็นตัวตัดสินสุดท้าย — ไม่มีตัวนี้ รายการที่จดเวลาเดียวกันจะสลับลำดับ
+    # ทุกครั้งที่ query (ฐานข้อมูลไม่รับประกันลำดับ) ต้นทุนเลยแกว่งไปมา (เจอ 16 พ.ย. 2026)
+    ev.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
+    return ev
+
+
+def lifo_costs(conn):
+    """
+    คิดต้นทุนทุกออเดอร์แบบ "ใช้ Token ชุดที่ซื้อล่าสุดก่อน" (LIFO)
+
+    กติกาจากเจ้าของ 16 พ.ย. 2026
+    ------------------------------
+    ซื้อ 4,200 Token เรท 21 → ออเดอร์ต่อไปใช้เรท 21 จนกว่า 4,200 ตัวจะหมด
+    หมดแล้วย้อนไปใช้ชุดที่ซื้อก่อนหน้า (เช่น 10.5) หมดอีกก็ย้อนไปชุดก่อนนั้น (เช่น 10)
+
+    ทำไมต้องเปลี่ยนจากแบบเดิม
+    แบบเดิมใช้ "เรทของการซื้อครั้งล่าสุด" ไปตลอดจนกว่าจะซื้อใหม่
+    14–16 พ.ย. 2026 ซื้อ Token ถูก 4,200 ตัว แต่ออเดอร์ใช้เรทนั้นไป 8,222 ตัว
+    ส่วนเกินถูกคิดทุนครึ่งเดียว กำไรเลยสูงเกินจริง
+
+    ของเหมานับเป็นชุดหนึ่งด้วย เรท = Token ที่คาดว่าจะได้ ÷ บาทที่จ่าย
+    ไม่งั้นต้นทุนรวมของทุกออเดอร์จะสูงกว่าเงินที่จ่ายจริง ~5,400฿ (ตรวจ 16 พ.ย.)
+
+    ออเดอร์ที่จดก่อนจดการซื้อ (Token ในระบบยังไม่พอ)
+    → ส่วนที่ขาดไปเอาจาก Token ชุดถัดไปที่เข้ามา
+    → ถ้าไม่มีชุดไหนเข้ามาอีกเลย ใช้เรทซื้อ Token ครั้งล่าสุด
+
+    คืน dict: id ออเดอร์ → เรทใหม่ (Token ต่อบาท)  และเรทของชุดบนสุดที่เหลือ
+    """
+    stack = []        # [[Token ที่เหลือ, เรท], ...] ตัวท้ายสุด = ชุดล่าสุด
+    owed = []         # [[id ออเดอร์, Token ที่ยังขาด], ...] รอชุดถัดไปมาเติม
+    cost = {}         # id → [บาทรวม, Token ที่คิดทุนแล้ว]
+    orig = {}         # id → (เรทเดิม, Token ทั้งหมด)
+    last_rate = None
+
+    for _, _, _, _, kind, d in _layer_events(conn):
+        if kind in ("in", "free"):
+            if kind == "free":
+                # Token ยกมา/ขายของตัวเอง ไม่มีเงินจ่ายออก แต่คิดเท่าเรทล่าสุด
+                # เพื่อไม่ให้ออเดอร์ที่ใช้ Token ชุดนี้ดูกำไรเว่อร์
+                rate = last_rate or None
+            else:
+                rate = d["rate"]
+                if d["kind"] == "token":
+                    last_rate = rate
+            left = d["tokens"]
+            if rate is None:
+                continue
+            # จ่ายหนี้ออเดอร์ที่จดไว้ก่อนก่อน (ตามลำดับที่ค้าง)
+            while owed and left > 0:
+                sid, need = owed[0]
+                take = min(need, left)
+                cost[sid][0] += take / rate
+                cost[sid][1] += take
+                left -= take
+                owed[0][1] -= take
+                if owed[0][1] <= 0:
+                    owed.pop(0)
+            if left > 0:
+                stack.append([left, rate])
+            continue
+
+        need = float(d["tokens_spent"]) if kind == "sale" else d["tokens"]
+        if kind == "sale":
+            sid = d["id"]
+            cost[sid] = [0.0, 0.0]
+            orig[sid] = (float(d["token_rate"]), need)
+        while need > 0 and stack:
+            top = stack[-1]
+            take = min(need, top[0])
+            if kind == "sale":
+                cost[sid][0] += take / top[1]
+                cost[sid][1] += take
+            top[0] -= take
+            need -= take
+            if top[0] <= 1e-9:
+                stack.pop()
+        if need > 0 and kind == "sale":
+            owed.append([sid, need])
+
+    # ที่ยังค้างจนจบ = ไม่มี Token ชุดไหนมาเติมแล้ว
+    # ใช้เรทซื้อ Token ครั้งล่าสุด (ถ้าวันนี้ต้องซื้อมาแทน ต้องจ่ายเท่านี้)
+    # ห้ามใช้เรทที่เก็บในออเดอร์นั้นเอง — มันถูกเขียนทับทุกรอบที่คิดใหม่
+    # ถ้าเอามาคิดต่อ ตัวเลขจะไหลไปเรื่อยๆ ทุกครั้งที่มีออเดอร์ใหม่
+    # (เรทในออเดอร์ใช้ได้เฉพาะตอนไม่เคยซื้อ Token เลย ซึ่งไม่มีอะไรเปลี่ยนมันอยู่แล้ว)
+    for sid, need in owed:
+        cost[sid][0] += need / (last_rate or orig[sid][0])
+        cost[sid][1] += need
+
+    rates = {}
+    for sid, (baht, tokens) in cost.items():
+        if tokens > 0 and baht > 0:
+            rates[sid] = tokens / baht
+        else:
+            rates[sid] = orig[sid][0]      # ออเดอร์ 0 Token คงเรทเดิม
+    top_rate = stack[-1][1] if stack else last_rate
+    return rates, top_rate
+
+
+def recost_sales(conn):
+    """
+    คิดต้นทุนทุกออเดอร์ใหม่ตามกติกา LIFO แล้วเขียนเรทกลับลงตาราง sale
+    เรียกทุกครั้งที่มีการเพิ่ม/ลบ/แก้ การขายหรือการซื้อ
+
+    เขียนลง token_rate ตรงๆ (ไม่เพิ่มคอลัมน์ใหม่) เพราะ VIEW v_sale
+    และรายงานทุกตัวคิดต้นทุนจากช่องนี้อยู่แล้ว
+    แก้เฉพาะแถวที่เรทเปลี่ยนจริง — ปกติเพิ่มออเดอร์ใหม่จะเปลี่ยนแค่แถวเดียว
+
+    คืน list ของ (id, เรทเดิม, เรทใหม่) ที่เปลี่ยน
+    """
+    from parser import HOT_RATE_THRESHOLD
+    rates, _ = lifo_costs(conn)
+    current = {r["id"]: (float(r["token_rate"]), r["source"]) for r in conn.execute(
+        "SELECT id, token_rate, source FROM sale").fetchall()}
+    changed = []
+    for sid, rate in rates.items():
+        # คอลัมน์ฝั่ง Postgres เก็บทศนิยม 3 ตำแหน่ง ปัดให้ตรงกันทั้งสองฝั่ง
+        new = round(rate, 3)
+        old, old_src = current[sid]
+        src = "hot_lot" if new >= HOT_RATE_THRESHOLD else "seller"
+        if abs(new - old) >= 0.0005 or src != old_src:
+            conn.execute("UPDATE sale SET token_rate = ?, source = ? WHERE id = ?",
+                         (new, src, sid))
+            changed.append((sid, old, new))
+    if changed:
+        conn.commit()
+    return changed
 
 
 def last_sale(conn):
@@ -118,6 +290,7 @@ def update_sale(conn, sale_id: int, sale: dict) -> bool:
          "item_count": sale.get("item_count", 1), "note": sale.get("note")},
     )
     conn.commit()
+    recost_sales(conn)
     return cur.rowcount > 0
 
 
@@ -205,6 +378,7 @@ def insert_purchase(conn, kind: str, baht: float, amount: int,
     new_id = cur.fetchone()[0]
     remember_for_undo(conn, "purchase", new_id)
     conn.commit()
+    recost_sales(conn)
     return new_id
 
 
@@ -222,6 +396,7 @@ def set_lot_realised(conn, purchase_id: int, tokens: int):
         (tokens, purchase_id),
     )
     conn.commit()
+    recost_sales(conn)
 
 
 def purchase_by_id(conn, purchase_id: int):
@@ -239,6 +414,7 @@ def last_purchase(conn):
 def delete_purchase(conn, purchase_id: int) -> bool:
     cur = conn.execute("DELETE FROM purchase WHERE id = ?", (purchase_id,))
     conn.commit()
+    recost_sales(conn)
     return cur.rowcount > 0
 
 
@@ -256,6 +432,9 @@ def add_token_move(conn, tokens: int, kind: str, note=None, happened_on=None) ->
     )
     new_id = cur.fetchone()[0]
     conn.commit()
+    # adjust ไม่กระทบต้นทุน (ดู _layer_events) ไม่ต้องคิดใหม่ ประหยัดรอบต่อฐานข้อมูล
+    if kind != "adjust":
+        recost_sales(conn)
     return new_id
 
 
@@ -550,8 +729,16 @@ def blended_rate(conn, fallback: float):
     เพราะของเหมาคิดเป็น 9% ของเงินที่จ่าย แต่ได้ Token มาถึง 17%
 
     คืนค่าเป็น (เรท, จำนวนล็อตที่ยังไม่ได้กรอกว่าย่อยได้เท่าไหร่)
-    ตัวหลังไว้เตือนเจ้าของ เพราะล็อตที่ยังไม่กรอกจะถูกนับว่าได้ Token 0
-    ทั้งที่จ่ายเงินไปแล้ว ทำให้เรทที่ได้ "ระวังตัวเกินจริง" ไปเล็กน้อย
+
+    Token ที่ได้มา ต้องนับ token_move ด้วย (แก้ 16 พ.ย. 2026)
+    -----------------------------------------------------------
+    30 ก.ย. เจ้าของเลิก /ย่อย แล้ว (ของเหมาปนกันในบูธ จำไม่ได้ว่าชิ้นไหนจากล็อตไหน)
+    Token จากของเหมาจึงเข้ามาทาง /นับ ในรูป kind='adjust' แทน
+    สูตรเดิมนับแต่ purchase → ล็อตที่ไม่ได้ /ย่อย นับว่าได้ Token 0 ทั้งที่จ่ายเงินไปแล้ว
+    ข้อมูลจริง 16 พ.ย.: 47 ล็อต 5,402฿ ได้ Token 0 → เรทออกมา 9.82
+    ซึ่งต่ำกว่าเรทของทุกแหล่ง (พ่อค้า 10.2–12.5 · เหมา 15–80) = เป็นไปไม่ได้
+    นับ token_move ทุกชนิดรวมด้วย: adjust ติดลบ (กดบูธแพงกว่า RAP)
+    และ other_out (ของที่ให้ไปฟรี) ก็เป็นต้นทุนจริง ต้องหักออกด้วย
     """
     row = conn.execute(
         """
@@ -563,9 +750,13 @@ def blended_rate(conn, fallback: float):
         FROM purchase
         """
     ).fetchone()
-    if not row["baht"] or not row["tokens"]:
+    moves = conn.execute(
+        "SELECT COALESCE(SUM(tokens), 0) FROM token_move"
+    ).fetchone()[0]
+    tokens = (row["tokens"] or 0) + (moves or 0)
+    if not row["baht"] or tokens <= 0:
         return fallback, (row["pending"] or 0)
-    return row["tokens"] / row["baht"], (row["pending"] or 0)
+    return tokens / float(row["baht"]), (row["pending"] or 0)
 
 
 def true_profit(conn, start_date: str, end_date: str, rate: float,
@@ -719,8 +910,59 @@ def mark_day(conn, log_date: str, shop_open=None, no_sale_reason=None,
 def set_inquiries(conn, log_date: str, n: int):
     conn.execute("INSERT INTO day_log (log_date) VALUES (?)"
         " ON CONFLICT (log_date) DO NOTHING", (log_date,))
-    conn.execute("UPDATE day_log SET inquiries = ? WHERE log_date = ?", (n, log_date))
+    # จดเองแล้ว = ไม่ใช่ค่าที่บอทเติมให้อีกต่อไป ลบป้ายออกจากหมายเหตุ
+    conn.execute(
+        "UPDATE day_log SET inquiries = ?, note = NULLIF(REPLACE(REPLACE("
+        "COALESCE(note, ''), ?, ''), ?, ''), '') WHERE log_date = ?",
+        (n, " · " + AUTO_INQ_NOTE, AUTO_INQ_NOTE, log_date))
     conn.commit()
+
+
+# ป้ายในหมายเหตุของวัน — แยกให้ออกว่าเลขคนทักวันไหนจดจริง วันไหนบอทเติมให้
+AUTO_INQ_NOTE = "ไม่ได้จด /ทัก ถือว่าปิดได้ 100%"
+
+
+def fill_default_inquiries(conn, until_date: str) -> int:
+    """
+    วันที่ไม่ได้จดจำนวนคนทัก → ถือว่าคนทัก = จำนวนออเดอร์ (ปิดการขายได้ 100%)
+
+    กติกาจากเจ้าของ 16 พ.ย. 2026: "วันไหนไม่ได้เขียนคนทัก ให้ตีว่าปิดได้ 100%"
+    เจ้าของปิดการขายได้เกือบทุกคนอยู่แล้ว ค่านี้จึงเป็นค่าปริยายที่ถูกเกือบทุกครั้ง
+    (ตรงกับกฎข้อ 8 ใน CLAUDE.md — ช่องที่ต้องพิมพ์ทุกวันจะไม่มีใครพิมพ์)
+    พ.ย. 2026 จด /ทัก แค่ 6 จาก 16 วัน ที่เหลือว่างจนคิดอัตราปิดการขายไม่ได้
+
+    วันที่ขายไม่ได้เพราะ "ไม่มีคนทัก" → คนทัก 0
+    วันที่ไม่ได้เปิดร้าน / ลืมจด / มีคนทักแต่ปิดไม่ได้ → ไม่เดา ปล่อยว่าง
+
+    ใส่ป้ายไว้ในหมายเหตุของวันเสมอ วิเคราะห์ทีหลังจะได้แยกออกว่าเลขไหนบอทเติม
+    เติมเฉพาะวันที่จบไปแล้ว (≤ until_date) วันนี้ยังขายไม่จบ ห้ามเติม
+    คืนจำนวนวันที่เติม
+    """
+    tag = (" · " + AUTO_INQ_NOTE, AUTO_INQ_NOTE)
+    cur = conn.execute(
+        """
+        UPDATE day_log
+        SET inquiries = (SELECT COUNT(*) FROM sale s WHERE s.sold_on = day_log.log_date),
+            note = CASE WHEN note IS NULL OR note = '' THEN ? ELSE note || ? END
+        WHERE inquiries IS NULL AND log_date <= ?
+          AND EXISTS (SELECT 1 FROM sale s WHERE s.sold_on = day_log.log_date)
+        """,
+        (tag[1], tag[0], until_date),
+    )
+    n = cur.rowcount or 0
+    cur = conn.execute(
+        """
+        UPDATE day_log
+        SET inquiries = 0,
+            note = CASE WHEN note IS NULL OR note = '' THEN ? ELSE note || ? END
+        WHERE inquiries IS NULL AND log_date <= ? AND no_sale_reason = 'no_inquiry'
+          AND NOT EXISTS (SELECT 1 FROM sale s WHERE s.sold_on = day_log.log_date)
+        """,
+        (tag[1], tag[0], until_date),
+    )
+    n += cur.rowcount or 0
+    conn.commit()
+    return n
 
 
 # ---------------------------------------------------------------- สรุปยอด

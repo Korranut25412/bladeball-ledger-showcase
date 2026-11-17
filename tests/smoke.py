@@ -164,6 +164,14 @@ check("ล็อตที่ยังไม่ย่อย นับเงิน
       abs(rate_after - 6.0) < 0.01, f"ได้ {rate_after} ควรเป็น 1200/200")
 check("นับได้ว่ามีล็อตค้างกี่ล็อต", pending_after == pending_before + 1)
 
+# ไม่ /ย่อย แต่ Token จากของเหมาเข้ามาทาง /นับ (adjust) — ต้องนับด้วย
+# 16 พ.ย. 2026 สูตรเดิมไม่นับ เรทจริงออกมา 9.82 ต่ำกว่าทุกแหล่ง
+mv = db.add_token_move(conn, 2700, "adjust")
+rate_adj, _ = db.blended_rate(conn, FAKE)
+check("Token ที่เข้ามาทาง /นับ ถูกนับในเรทเฉลี่ย",
+      abs(rate_adj - 19.5) < 0.01, f"ได้ {rate_adj} ควรเป็น 3900/200")
+conn.execute("DELETE FROM token_move WHERE id = ?", (mv,)); conn.commit()
+
 db.set_lot_realised(conn, db.latest_lot(conn)["id"], 2700)
 rate_done, pending_done = db.blended_rate(conn, FAKE)
 check("กรอกย่อยแล้วเรทขึ้นและไม่ค้าง",
@@ -348,7 +356,10 @@ try:
     out.clear()
     bot.run_scheduled_jobs(conn)
     nightly = "\n".join(out)
-    check("สรุปกลางคืนถามจำนวนคนทัก", "มีคนทักกี่คน" in nightly, nightly[:150])
+    # 16 พ.ย. 2026 เลิกถาม — ไม่ได้จด = เติมให้ว่าปิด 100% แล้วบอกให้รู้แทน
+    check("สรุปกลางคืน ไม่ได้จดคนทัก → เติมให้และบอก",
+          "ถือว่าปิดได้ 100%" in nightly
+          and db.day_summary(conn, _yesterday.isoformat())["inquiries"] == 1, nightly[:300])
 
     db.set_inquiries(conn, _yesterday.isoformat(), 12)
     conn.execute("DELETE FROM job_log")
@@ -609,6 +620,75 @@ try:
     check("ยอดเก่าข้ามเดือน → เตือนให้อัปเดต", "ก่อนวันที่ 1 เดือนนี้" in r, r[:300])
 finally:
     db.now_th = _real_now2
+
+# ของตุนต้นเดือนต้องนับบูธแบบเดียวกับปลายเดือน
+# 16 พ.ย. 2026 ต้นเดือนไม่นับบูธ ปลายเดือนนับ → บูธ 15,650 ที่จดไว้ตั้งแต่ ต.ค.
+# ถูกนับเป็นกำไรจริงของ พ.ย. เกินมา ~1,475฿
+reset()
+_ms = "2026-11-01"
+db.set_state(conn, "booth_tokens", 10000)
+conn.execute("UPDATE app_state SET updated_at = '2026-10-20T00:00:00+07:00' "
+             "WHERE key = 'booth_tokens'"); conn.commit()
+check("บูธที่จดก่อนต้นเดือน นับเข้าของตุนต้นเดือน",
+      abs(bot.stock_tokens_at(conn, _ms) - 9900) < 0.01, str(bot.stock_tokens_at(conn, _ms)))
+conn.execute("UPDATE app_state SET updated_at = '2026-11-05T00:00:00+07:00' "
+             "WHERE key = 'booth_tokens'"); conn.commit()
+check("บูธที่จดระหว่างเดือน ไม่นับเข้าต้นเดือน (ไม่รู้ว่าต้นเดือนมีเท่าไหร่)",
+      bot.stock_tokens_at(conn, _ms) == 0, str(bot.stock_tokens_at(conn, _ms)))
+from datetime import date as _D                                  # noqa: E402
+bot.save_month_stock(conn, _D(2026, 11, 16))
+_saved = db.get_state(conn, "stock_tokens_2026-11")
+db.set_state(conn, "booth_tokens", 50000)                        # จดบูธใหม่ทีหลัง
+bot.save_month_stock(conn, _D(2026, 11, 20))
+check("จดของตุนต้นเดือนครั้งเดียว ไม่เปลี่ยนตามบูธที่จดทีหลัง",
+      _saved is not None and db.get_state(conn, "stock_tokens_2026-11") == _saved)
+
+# ต้นทุนแบบ LIFO ตามกติกาเจ้าของ 16 พ.ย. 2026
+# "ซื้อ 4,200 เรท 21 หมดแล้วใช้ 10.5 ที่ซื้อก่อนหน้า หมดอีกใช้ 10"
+reset()
+say("/ซื้อ 1000 100")        # เรท 10
+say("/ซื้อ 1050 100")        # เรท 10.5
+say("/ซื้อ 4200 200")        # เรท 21
+say("400 5000")              # 4,200 @21 + 800 @10.5
+s1 = conn.execute("SELECT * FROM v_sale ORDER BY id DESC LIMIT 1").fetchone()
+check("LIFO: ใช้ชุดล่าสุดก่อน หมดแล้วต่อชุดก่อนหน้า",
+      abs(float(s1["cost_baht"]) - (200 + 800 / 10.5)) < 0.05, str(s1["cost_baht"]))
+say("100 500")               # เหลือ 250 @10.5 + 250 @10
+s2 = conn.execute("SELECT * FROM v_sale ORDER BY id DESC LIMIT 1").fetchone()
+check("LIFO: ชุด 10.5 หมดแล้วย้อนไปชุด 10",
+      abs(float(s2["cost_baht"]) - (250 / 10.5 + 250 / 10)) < 0.05, str(s2["cost_baht"]))
+check("LIFO: คิดซ้ำอีกรอบ ตัวเลขไม่ไหล", db.recost_sales(conn) == [])
+check("LIFO: ต้นทุนรวมเท่าเงินที่จ่ายพอดีเมื่อใช้ Token หมด (ไม่นับเกิน/ขาด)",
+      abs(sum(float(r["cost_baht"]) for r in conn.execute("SELECT cost_baht FROM v_sale"))
+          - (200 + 800 / 10.5 + 250 / 10.5 + 250 / 10)) < 0.05)
+say("/undo")
+check("LIFO: ลบออเดอร์แล้ว ออเดอร์ก่อนหน้าไม่เปลี่ยน",
+      abs(float(conn.execute("SELECT cost_baht FROM v_sale").fetchone()[0])
+          - float(s1["cost_baht"])) < 0.01)
+
+# ไม่ได้จด /ทัก = ถือว่าปิดได้ 100% (เจ้าของสั่ง 16 พ.ย. 2026)
+reset()
+db.insert_sale(conn, {"sold_on": "2026-11-10", "price_baht": 55, "tokens_spent": 500,
+                      "token_rate": 11.0})
+db.insert_sale(conn, {"sold_on": "2026-11-10", "price_baht": 60, "tokens_spent": 500,
+                      "token_rate": 11.0})
+db.mark_day(conn, "2026-11-11", shop_open=1, no_sale_reason="no_inquiry")
+db.mark_day(conn, "2026-11-12", shop_open=0, no_sale_reason="not_open")
+db.insert_sale(conn, {"sold_on": "2026-11-13", "price_baht": 55, "tokens_spent": 500,
+                      "token_rate": 11.0})
+db.fill_default_inquiries(conn, "2026-11-12")
+_d = {r["log_date"]: r for r in conn.execute("SELECT * FROM v_day")}
+check("ไม่ได้จดคนทัก → คนทัก = ออเดอร์ (ปิด 100%)",
+      _d["2026-11-10"]["inquiries"] == 2 and _d["2026-11-10"]["close_rate_pct"] == 100)
+check("วันไม่มีคนทัก → คนทัก 0", _d["2026-11-11"]["inquiries"] == 0)
+check("วันปิดร้าน ไม่เดา", _d["2026-11-12"]["inquiries"] is None)
+check("วันที่ยังไม่จบ ไม่เติม", _d["2026-11-13"]["inquiries"] is None)
+check("ใส่ป้ายว่าบอทเติมเอง", db.AUTO_INQ_NOTE in (_d["2026-11-10"]["note"] or "")
+      if "note" in _d["2026-11-10"].keys() else
+      db.AUTO_INQ_NOTE in conn.execute("SELECT note FROM day_log WHERE log_date='2026-11-10'").fetchone()[0])
+db.set_inquiries(conn, "2026-11-10", 5)
+_r = conn.execute("SELECT inquiries, note FROM day_log WHERE log_date='2026-11-10'").fetchone()
+check("/ทัก ทับค่าที่เติม และลบป้ายออก", _r["inquiries"] == 5 and not _r["note"], str(dict(_r)))
 
 reset()
 print("\n" + ("ผ่านหมด" if not fails else f"มีปัญหา {len(fails)} จุด: " + ", ".join(fails)))
