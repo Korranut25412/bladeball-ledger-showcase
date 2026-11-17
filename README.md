@@ -230,11 +230,11 @@ One line per entry. You can also send multiple lines at once (log everything in 
 
 ### The bot also messages you on its own
 
-- **Every midnight:** a summary of the day that just ended, compared against the 290 THB target.
+- **Every midnight:** a summary of the day that just ended, compared against the daily target (`TARGET_DAY` in `.env`).
   Midnight was chosen because the best selling window is **7 PM–10 PM** (after school), so an earlier summary would be incomplete.
   If there was no revenue at all that day, it asks why, with 4 buttons to tap.
 - **Late-night sales after midnight:** prefix the line with `เมื่อวาน` (yesterday) and the sale is logged to the correct date.
-- **Every Monday:** a summary of the week that just ended, compared against the 2,030 THB target.
+- **Every Monday:** a summary of the week that just ended, compared against the weekly target (`TARGET_WEEK` in `.env`).
 - **If the bot was off for several days:** it goes back through the last 7 days and asks about the missed days.
 - **On the 1st of every month:** the transfer steps, plus a **check that the recorded totals match the bank balance**
   (the Krungthai balance should equal the 1,000 THB float + recorded profit; if they differ by more than 100 THB, something is wrong).
