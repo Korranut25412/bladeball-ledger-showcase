@@ -12,5 +12,10 @@ __pycache__/
 
 prompts/
 
-# รูปที่ prep.py สร้าง (สร้างใหม่ทุกรอบ)
+# รูปโพสต์/เครดิตที่สคริปต์ posting/ สร้าง (ใหญ่ และสร้างใหม่ได้ทุกรอบ)
 posting/ready/
+posting/proof/*.jpg
+posting/proof/*.png
+
+# ไฟล์สถานะแชท = โน้ตเฉพาะเครื่อง/โฟลเดอร์ (main กับ worktree มีคนละไฟล์ · track แล้วจะทับกันตอน merge)
+/_สถานะล่าสุด.md
